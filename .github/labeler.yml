@@ -1,0 +1,43 @@
+# Configuration for auto-labeling PRs based on changed files
+
+backend:
+  - backend/**/*
+
+frontend:
+  - frontend/**/*
+
+docker:
+  - docker/**/*
+  - Dockerfile
+  - docker-compose*.yml
+
+ci/cd:
+  - .github/**/*
+
+documentation:
+  - "**/*.md"
+  - docs/**/*
+
+tests:
+  - "**/*test*"
+  - "**/*spec*"
+  - tests/**/*
+
+dependencies:
+  - "**/requirements*.txt"
+  - "**/package*.json"
+  - "**/Pipfile*"
+  - "**/poetry.lock"
+
+configuration:
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.toml"
+  - "**/*.ini"
+  - "**/*.env*"
+
+security:
+  - "**/auth*"
+  - "**/security*"
+  - "**/*token*"
+  - "**/*secret*"

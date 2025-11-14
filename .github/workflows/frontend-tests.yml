@@ -1,0 +1,226 @@
+name: Frontend Tests
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-tests.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-tests.yml'
+
+jobs:
+  test:
+    name: Run Frontend Tests
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: ['18.x', '20.x']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Cache node modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          frontend/node_modules
+          ~/.npm
+        key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('frontend/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-${{ matrix.node-version }}-
+          ${{ runner.os }}-node-
+    
+    - name: Install dependencies
+      working-directory: frontend
+      run: |
+        npm ci --prefer-offline --no-audit
+    
+    - name: Run linting
+      working-directory: frontend
+      run: |
+        npm run lint
+    
+    - name: Run type checking
+      working-directory: frontend
+      run: |
+        npm run type-check
+    
+    - name: Run unit tests with coverage
+      working-directory: frontend
+      run: |
+        npm test -- --coverage --watchAll=false --passWithNoTests
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: frontend/coverage/lcov.info
+        flags: frontend
+        name: Frontend Coverage
+        fail_ci_if_error: false
+    
+    - name: Upload coverage HTML report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: frontend-coverage-report-${{ matrix.node-version }}
+        path: frontend/coverage/lcov-report/
+    
+    - name: Build application
+      working-directory: frontend
+      run: |
+        npm run build
+    
+    - name: Check bundle size
+      working-directory: frontend
+      run: |
+        npm install -g bundlesize2
+        echo '[{"path": ".next/static/**/*.js", "maxSize": "500kb"}]' > .bundlesize.json
+        bundlesize -c .bundlesize.json || true
+    
+  e2e-test:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+    
+    - name: Install dependencies
+      working-directory: frontend
+      run: |
+        npm ci --prefer-offline --no-audit
+        npx playwright install --with-deps
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Start backend mock server
+      run: |
+        cd backend
+        pip install fastapi uvicorn
+        cat > mock_server.py << 'EOF'
+        from fastapi import FastAPI
+        from fastapi.middleware.cors import CORSMiddleware
+        
+        app = FastAPI()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        @app.get("/api/v1/health")
+        def health():
+            return {"status": "healthy"}
+        
+        @app.post("/api/v1/auth/login")
+        def login():
+            return {"access_token": "mock-token", "token_type": "bearer"}
+        
+        @app.get("/api/v1/auth/me")
+        def me():
+            return {"user_id": "test", "email": "test@example.com"}
+        
+        @app.get("/api/v1/documents")
+        def documents():
+            return {"documents": []}
+        
+        @app.post("/api/v1/chat")
+        def chat():
+            return {"response": "Mock response", "sources": []}
+        EOF
+        uvicorn mock_server:app --host 0.0.0.0 --port 8000 &
+        sleep 5
+    
+    - name: Run E2E tests
+      working-directory: frontend
+      run: |
+        npm run test:e2e -- --reporter=html || true
+    
+    - name: Upload Playwright report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: playwright-report
+        path: frontend/playwright-report/
+    
+    - name: Upload Playwright videos
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: playwright-videos
+        path: frontend/test-results/
+    
+  accessibility-test:
+    name: Accessibility Tests
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+    
+    - name: Install dependencies
+      working-directory: frontend
+      run: |
+        npm ci --prefer-offline --no-audit
+        npm install -D @axe-core/playwright
+    
+    - name: Build application
+      working-directory: frontend
+      run: |
+        npm run build
+        npm run start &
+        npx wait-on http://localhost:3000
+    
+    - name: Run accessibility tests
+      working-directory: frontend
+      run: |
+        cat > a11y-test.js << 'EOF'
+        const { chromium } = require('playwright');
+        const { injectAxe, checkA11y } = require('@axe-core/playwright');
+        
+        (async () => {
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          await page.goto('http://localhost:3000');
+          await injectAxe(page);
+          const results = await checkA11y(page);
+          
+          if (results.violations.length > 0) {
+            console.error('Accessibility violations found:', results.violations);
+            process.exit(1);
+          }
+          
+          console.log('No accessibility violations found!');
+          await browser.close();
+        })();
+        EOF
+        node a11y-test.js || true

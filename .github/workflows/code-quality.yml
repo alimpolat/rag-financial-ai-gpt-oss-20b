@@ -1,0 +1,257 @@
+name: Code Quality & Security
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better analysis
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+    
+    - name: Python Code Quality
+      working-directory: backend
+      run: |
+        pip install black isort flake8 mypy pylint
+        
+        echo "::group::Black Formatting Check"
+        black . --check --diff
+        echo "::endgroup::"
+        
+        echo "::group::Import Sorting Check"
+        isort . --check-only --diff
+        echo "::endgroup::"
+        
+        echo "::group::Flake8 Linting"
+        flake8 . --max-line-length=100 --exclude=venv,__pycache__ --statistics
+        echo "::endgroup::"
+        
+        echo "::group::Pylint Analysis"
+        pylint **/*.py --exit-zero --score=y
+        echo "::endgroup::"
+    
+    - name: TypeScript/JavaScript Code Quality
+      working-directory: frontend
+      run: |
+        npm ci --prefer-offline --no-audit
+        
+        echo "::group::ESLint"
+        npm run lint
+        echo "::endgroup::"
+        
+        echo "::group::TypeScript Check"
+        npm run type-check
+        echo "::endgroup::"
+    
+    - name: Markdown Linting
+      run: |
+        npm install -g markdownlint-cli
+        markdownlint '**/*.md' --ignore node_modules --ignore venv
+  
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: python, javascript
+        queries: security-extended
+    
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v2
+    
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+    
+    - name: Run Trivy security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+    
+    - name: Upload Trivy results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Python dependency check
+      working-directory: backend
+      run: |
+        pip install safety
+        safety check --json > safety-report.json || true
+        cat safety-report.json
+    
+    - name: JavaScript dependency audit
+      working-directory: frontend
+      run: |
+        npm audit --json > npm-audit.json || true
+        npm audit --audit-level=high
+  
+  sonarcloud:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarcloud-github-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        args: >
+          -Dsonar.projectKey=rag-financial-ai
+          -Dsonar.organization=${{ github.repository_owner }}
+          -Dsonar.sources=backend,frontend/src
+          -Dsonar.tests=backend/tests,frontend/tests
+          -Dsonar.python.coverage.reportPaths=backend/coverage.xml
+          -Dsonar.javascript.lcov.reportPaths=frontend/coverage/lcov.info
+  
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check Python licenses
+      working-directory: backend
+      run: |
+        pip install pip-licenses
+        pip-licenses --format=markdown --with-urls --output-file=licenses-python.md
+        
+        # Check for copyleft licenses
+        pip-licenses --format=json | python -c "
+        import json, sys
+        licenses = json.load(sys.stdin)
+        copyleft = ['GPL', 'LGPL', 'AGPL', 'MPL']
+        issues = [pkg for pkg in licenses if any(cl in pkg.get('License', '') for cl in copyleft)]
+        if issues:
+            print('Warning: Copyleft licenses found:', issues)
+            sys.exit(1)
+        "
+    
+    - name: Check JavaScript licenses
+      working-directory: frontend
+      run: |
+        npx license-checker --json --out licenses-npm.json
+        npx license-checker --onlyAllow 'MIT;Apache-2.0;BSD;ISC;CC0-1.0;CC-BY-3.0;CC-BY-4.0;Unlicense'
+    
+    - name: Upload license reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: license-reports
+        path: |
+          backend/licenses-python.md
+          frontend/licenses-npm.json
+  
+  complexity-analysis:
+    name: Code Complexity Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Analyze Python complexity
+      working-directory: backend
+      run: |
+        pip install radon xenon
+        
+        echo "::group::Cyclomatic Complexity"
+        radon cc . -s -a --total-average
+        echo "::endgroup::"
+        
+        echo "::group::Maintainability Index"
+        radon mi . -s
+        echo "::endgroup::"
+        
+        echo "::group::Complexity Violations"
+        xenon . --max-absolute B --max-modules B --max-average A
+        echo "::endgroup::"
+    
+    - name: Analyze JavaScript complexity
+      working-directory: frontend
+      run: |
+        npm install -g complexity-report
+        npx cr src --format json --output complexity.json
+        
+        # Check complexity thresholds
+        node -e "
+        const report = require('./complexity.json');
+        const issues = report.reports.filter(r => r.complexity > 20);
+        if (issues.length > 0) {
+          console.log('High complexity files:', issues.map(i => i.path));
+        }
+        "
+  
+  documentation:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check for missing documentation
+      run: |
+        # Check if important files exist
+        files=("README.md" "CLAUDE.md" "CONTRIBUTING.md" "LICENSE")
+        for file in "${files[@]}"; do
+          if [[ ! -f "$file" ]]; then
+            echo "Warning: $file is missing"
+          fi
+        done
+        
+        # Check for TODO comments
+        echo "::group::TODO Comments"
+        grep -r "TODO\|FIXME\|HACK\|XXX" --include="*.py" --include="*.ts" --include="*.tsx" . || true
+        echo "::endgroup::"
+    
+    - name: Generate API documentation
+      working-directory: backend
+      run: |
+        pip install pydoc-markdown
+        pydoc-markdown --render-toc > API.md || true

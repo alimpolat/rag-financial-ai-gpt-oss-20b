@@ -1,0 +1,266 @@
+name: Deploy to Production
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      environment: ${{ steps.env.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Determine version
+      id: version
+      run: |
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION="dev-${GITHUB_SHA::8}"
+        fi
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+    
+    - name: Determine environment
+      id: env
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          ENV="${{ github.event.inputs.environment }}"
+        elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          ENV="production"
+        else
+          ENV="staging"
+        fi
+        echo "environment=${ENV}" >> $GITHUB_OUTPUT
+  
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.rag-financial-ai.example.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-west-2
+    
+    - name: Deploy to ECS Staging
+      run: |
+        # Update task definition with new image
+        aws ecs update-service \
+          --cluster rag-staging \
+          --service rag-backend \
+          --force-new-deployment \
+          --desired-count 2
+        
+        aws ecs update-service \
+          --cluster rag-staging \
+          --service rag-frontend \
+          --force-new-deployment \
+          --desired-count 2
+        
+        # Wait for services to stabilize
+        aws ecs wait services-stable \
+          --cluster rag-staging \
+          --services rag-backend rag-frontend
+    
+    - name: Run smoke tests
+      run: |
+        # Wait for deployment to complete
+        sleep 60
+        
+        # Health check
+        curl -f https://staging-api.rag-financial-ai.example.com/api/v1/health || exit 1
+        
+        # Basic functionality test
+        curl -X POST https://staging-api.rag-financial-ai.example.com/api/v1/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{"email":"test@example.com","password":"testpass"}' || exit 1
+    
+    - name: Notify deployment status
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          Staging Deployment ${{ job.status }}
+          Version: ${{ needs.prepare.outputs.version }}
+          Actor: ${{ github.actor }}
+          Commit: ${{ github.sha }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+  
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-staging]
+    if: needs.prepare.outputs.environment == 'production' || (needs.prepare.outputs.environment == 'staging' && success())
+    environment:
+      name: production
+      url: https://rag-financial-ai.example.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-west-2
+    
+    - name: Create deployment backup
+      run: |
+        # Backup current task definitions
+        aws ecs describe-task-definition \
+          --task-definition rag-backend-prod \
+          > backup-backend-$(date +%Y%m%d-%H%M%S).json
+        
+        aws ecs describe-task-definition \
+          --task-definition rag-frontend-prod \
+          > backup-frontend-$(date +%Y%m%d-%H%M%S).json
+        
+        # Upload backups to S3
+        aws s3 cp backup-*.json s3://rag-deployments-backup/$(date +%Y%m%d)/
+    
+    - name: Blue-Green Deployment
+      run: |
+        # Create new target group
+        NEW_TG_ARN=$(aws elbv2 create-target-group \
+          --name rag-prod-${GITHUB_SHA::8} \
+          --protocol HTTP \
+          --port 80 \
+          --vpc-id vpc-xxx \
+          --query 'TargetGroups[0].TargetGroupArn' \
+          --output text)
+        
+        # Update ECS service with new target group
+        aws ecs update-service \
+          --cluster rag-production \
+          --service rag-backend \
+          --load-balancers targetGroupArn=$NEW_TG_ARN,containerName=backend,containerPort=8000 \
+          --force-new-deployment
+        
+        # Wait for new tasks to be healthy
+        aws ecs wait services-stable \
+          --cluster rag-production \
+          --services rag-backend
+        
+        # Switch traffic to new target group
+        aws elbv2 modify-listener \
+          --listener-arn arn:aws:elasticloadbalancing:xxx \
+          --default-actions Type=forward,TargetGroupArn=$NEW_TG_ARN
+        
+        # Keep old target group for rollback (delete after 24h)
+        echo $OLD_TG_ARN > rollback-tg.txt
+    
+    - name: Run production tests
+      run: |
+        # Comprehensive health checks
+        ./scripts/production-health-check.sh
+        
+        # Performance baseline test
+        npm install -g artillery
+        artillery quick \
+          --count 10 \
+          --num 100 \
+          https://api.rag-financial-ai.example.com/api/v1/health
+    
+    - name: Create release notes
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## Changes in this release
+          - See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+          
+          ## Docker Images
+          - Backend: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${{ needs.prepare.outputs.version }}`
+          - Frontend: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend:${{ needs.prepare.outputs.version }}`
+        draft: false
+        prerelease: false
+    
+    - name: Notify deployment status
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          🚀 Production Deployment ${{ job.status }}
+          Version: ${{ needs.prepare.outputs.version }}
+          Actor: ${{ github.actor }}
+          Environment: https://rag-financial-ai.example.com
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+  
+  rollback:
+    name: Rollback if Failed
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: failure()
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-west-2
+    
+    - name: Rollback deployment
+      run: |
+        # Get previous target group
+        OLD_TG_ARN=$(cat rollback-tg.txt)
+        
+        # Switch traffic back
+        aws elbv2 modify-listener \
+          --listener-arn arn:aws:elasticloadbalancing:xxx \
+          --default-actions Type=forward,TargetGroupArn=$OLD_TG_ARN
+        
+        echo "Rollback completed"
+    
+    - name: Notify rollback
+      uses: 8398a7/action-slack@v3
+      with:
+        status: custom
+        custom_payload: |
+          {
+            text: "⚠️ Production deployment rolled back",
+            attachments: [{
+              color: 'warning',
+              text: 'Automatic rollback triggered due to deployment failure'
+            }]
+          }
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
