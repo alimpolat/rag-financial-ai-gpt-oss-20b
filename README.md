@@ -259,7 +259,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Contact
 
-**Ali Murat Polat** - [LinkedIn](https://se.linkedin.com/in/alimpolat) - Data Scientist
+**Alim Polat** - [LinkedIn](https://se.linkedin.com/in/alimpolat) - Data Scientist
 
 Project Link: [https://github.com/alimpolat/rag-financial-ai-gpt-oss-20b](https://github.com/alimpolat/rag-financial-ai-gpt-oss-20b)
 
